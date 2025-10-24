@@ -17,6 +17,7 @@ import sys
 import time
 import csv
 import math
+from collections import deque
 from datetime import datetime
 import os
 
@@ -28,7 +29,7 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib as mpl
 
-# Lightweight rendering tweaks
+# Lightweight rendering tweaks to reduce CPU
 mpl.rcParams['path.simplify'] = True
 mpl.rcParams['path.simplify_threshold'] = 0.5
 mpl.rcParams['agg.path.chunksize'] = 2000
@@ -59,8 +60,8 @@ class SensorClient:
         self.connecting = False
         self.measurements = []
         self.selected_measurement = None
-        # synchronized buffers (time, value) at 10 Hz
-        self.data = []
+        # synchronized buffers (time, value) at 10 Hz (use deque for stability)
+        self.data = deque(maxlen=300)
         self.threshold = 0.0
         # UI variables will be attached dynamically by App
 
@@ -161,14 +162,16 @@ class App(tk.Tk):
             SensorClient('B', '#388e3c'),  # green
             SensorClient('C', '#1976d2'),  # blue
         ]
+        # Prefill sensor IDs for A, B, C (if provided)
+        self.default_ids = ['966-489', '946-449', '964-462']
         self.recording = False
         self.t0 = None  # recording start time
         self._tick_after_id = None
 
         self._build_ui()
-        # schedule periodic plot refresh (lower rate for stability)
-        self.plot_interval_ms = 500
-        self.fft_interval_s = 2.0
+        # schedule periodic plot refresh (balanced for smoothness vs CPU)
+        self.plot_interval_ms = 150
+        self.fft_interval_s = 1.0
         self.after(self.plot_interval_ms, self._refresh_plots)
         # CSV logging state
         self.csv_file = None
@@ -176,16 +179,23 @@ class App(tk.Tk):
         self.csv_path = None
         self.csv_dir = os.path.join(os.getcwd(), 'recordings')
         os.makedirs(self.csv_dir, exist_ok=True)
+        # Configure ring buffer length based on window and fs
+        self.window_s = 30.0
+        self.buffer_len = int(self.window_s * self.fs)
+        for s in self.sensors:
+            s.data = deque(maxlen=self.buffer_len)
+        # Batched CSV flushing to avoid I/O stalls
+        self._csv_flush_every = 20
+        self._csv_flush_count = 0
 
     def _build_ui(self):
         header = ttk.Label(self, text='Giải pháp đo dao động kết cấu nhịp cầu bằng hệ thống thiết bị đo dao động không dây', font=('Segoe UI', 12, 'bold'))
         header.grid(row=0, column=0, columnspan=3, pady=6)
 
-        # Create narrow left column for connect/log; plots take most space
-        self.left_min = 220
-        self.columnconfigure(0, weight=0, minsize=self.left_min)
-        self.columnconfigure(1, weight=1)
-        self.columnconfigure(2, weight=1)
+        # Create 3 columns with 2:4:4 ratio
+        self.columnconfigure(0, weight=2)
+        self.columnconfigure(1, weight=4)
+        self.columnconfigure(2, weight=4)
         # Allow the main row (plots + controls) to expand
         self.rowconfigure(1, weight=1)
 
@@ -205,13 +215,19 @@ class App(tk.Tk):
 
     def _build_left(self, left: ttk.Frame):
         # Per-sensor connection panels
-        for s in self.sensors:
+        for idx, s in enumerate(self.sensors):
             fr = ttk.Labelframe(left, text=f'Sensor {s.name}')
             fr.pack(fill='x', padx=4, pady=4)
 
             ttk.Label(fr, text='ID (e.g. 123-456):').grid(row=0, column=0, sticky='w')
             id_var = tk.StringVar()
             s.id_var = id_var
+            # Auto-fill known IDs by order A, B, C
+            try:
+                if idx < len(self.default_ids):
+                    s.id_var.set(self.default_ids[idx])
+            except Exception:
+                pass
             ttk.Entry(fr, textvariable=id_var, width=12).grid(row=0, column=1, sticky='w', padx=4)
             btn_connect = ttk.Button(fr, text='Connect', command=lambda ss=s: self.connect_sensor_async(ss))
             btn_disconnect = ttk.Button(fr, text='Disconnect', command=lambda ss=s: self.disconnect_sensor(ss))
@@ -239,6 +255,14 @@ class App(tk.Tk):
         ttk.Button(ctl, text='Stop', command=self.stop_recording).pack(side='left', padx=3)
         ttk.Button(ctl, text='Save All CSV', command=self.save_all_csv).pack(side='left', padx=3)
 
+        # Performance toggles
+        perf = ttk.Frame(left)
+        perf.pack(fill='x', padx=4, pady=2)
+        self.performance_mode = tk.BooleanVar(value=False)
+        self.fft_enabled = tk.BooleanVar(value=True)
+        ttk.Checkbutton(perf, text='Performance Mode', variable=self.performance_mode).pack(side='left')
+        ttk.Checkbutton(perf, text='Enable FFT', variable=self.fft_enabled).pack(side='left', padx=8)
+
         # Log
         ttk.Label(left, text='Log').pack(anchor='w', padx=4)
         self.log_text = tk.Text(left, height=6)
@@ -250,7 +274,7 @@ class App(tk.Tk):
     def _build_middle(self, mid: ttk.Frame):
         ttk.Label(mid, text='Time-domain (Acceleration)').pack(anchor='w')
         # Matplotlib Figure with 3 stacked subplots (one per sensor)
-        self.fig_time = Figure(figsize=(6, 5), dpi=90)
+        self.fig_time = Figure(figsize=(6, 5), dpi=100)
         self.ax_time = []
         self.time_lines = {}
         for i, s in enumerate(self.sensors):
@@ -261,8 +285,8 @@ class App(tk.Tk):
             ax.set_title(f'Sensor {s.name}', fontsize=9)
             if i == 2:
                 ax.set_xlabel('Time [s]')
-            ax.set_ylabel('Acceleration [m/s²]')
-            line, = ax.plot([], [], color=s.color, lw=1.2, antialiased=False)
+            ax.set_ylabel('Acceleration $[m/s^2]$')
+            line, = ax.plot([], [], color=s.color, lw=1.5)
             self.ax_time.append(ax)
             self.time_lines[s.name] = line
         self.canvas_time = FigureCanvasTkAgg(self.fig_time, master=mid)
@@ -278,7 +302,7 @@ class App(tk.Tk):
 
     def _build_right(self, right: ttk.Frame):
         ttk.Label(right, text='FFT').pack(anchor='w')
-        self.fig_fft = Figure(figsize=(6, 5), dpi=90)
+        self.fig_fft = Figure(figsize=(6, 5), dpi=100)
         self.ax_fft = []
         self.fft_lines = {}
         for i, s in enumerate(self.sensors):
@@ -290,7 +314,7 @@ class App(tk.Tk):
             if i == 2:
                 ax.set_xlabel('Frequency [Hz]')
             ax.set_ylabel('Magnitude')
-            line, = ax.plot([], [], color=s.color, lw=1.0, antialiased=False)
+            line, = ax.plot([], [], color=s.color, lw=1.2)
             self.ax_fft.append(ax)
             self.fft_lines[s.name] = line
         self.canvas_fft = FigureCanvasTkAgg(self.fig_fft, master=right)
@@ -302,6 +326,13 @@ class App(tk.Tk):
         ts = time.strftime('%H:%M:%S')
         self.log_text.insert('end', f'[{ts}] {msg}\n')
         self.log_text.see('end')
+        # keep log compact to avoid UI slowdown
+        try:
+            lines = int(float(self.log_text.index('end-1c').split('.')[0]))
+            if lines > 300:
+                self.log_text.delete('1.0', '50.0')
+        except Exception:
+            pass
 
     def connect_sensor(self, sensor: SensorClient):
         sid = sensor.id_var.get().strip()
@@ -326,6 +357,11 @@ class App(tk.Tk):
             elif sensor.meas_cb['values']:
                 sensor.selected_measurement = sensor.meas_cb['values'][0]
                 sensor.meas_var.set(sensor.selected_measurement)
+            # cache unit for the selected measurement
+            try:
+                sensor.unit = sensor.dev.get_measurement_unit(sensor.selected_measurement) or ''
+            except Exception:
+                sensor.unit = ''
             self.log(f'Sensor {sensor.name}: connected.')
         except Exception as e:
             self.log(f'Sensor {sensor.name}: failed to connect: {e}')
@@ -333,6 +369,10 @@ class App(tk.Tk):
 
         def on_meas_change(*_):
             sensor.selected_measurement = sensor.meas_var.get()
+            try:
+                sensor.unit = sensor.dev.get_measurement_unit(sensor.selected_measurement) or ''
+            except Exception:
+                sensor.unit = ''
         sensor.meas_var.trace_add('write', on_meas_change)
 
     def connect_sensor_async(self, sensor: SensorClient):
@@ -399,6 +439,17 @@ class App(tk.Tk):
                 pass
             self._tick_after_id = None
         self.log('Recording stopped.')
+        # ensure CSV is flushed and closed
+        try:
+            if self.csv_file:
+                self.csv_file.flush()
+                self.csv_file.close()
+        except Exception:
+            pass
+        finally:
+            self.csv_file = None
+            self.csv_writer = None
+            self._csv_flush_count = 0
         # Close CSV log if open
         try:
             if self.csv_file:
@@ -430,8 +481,6 @@ class App(tk.Tk):
                 if isinstance(val, (int, float)):
                     any_read = True
                     s.data.append((stamp, val))
-                    if len(s.data) > window_max_len:
-                        s.data = s.data[-window_max_len:]
                     s.val_var.set(f"{val:.4f}")
                     thr = None
                     try:
@@ -440,16 +489,11 @@ class App(tk.Tk):
                         pass
                     if thr and abs(val) >= abs(thr):
                         s.val_lbl.configure(foreground='red')
-                        if winsound and (time.perf_counter() - getattr(self, '_last_beep', 0)) > 0.5:
-                            # Run beep on a background thread to avoid blocking UI
-                            import threading
-                            def _beep():
-                                try:
-                                    winsound.Beep(2000, 60)
-                                except Exception:
-                                    pass
-                            threading.Thread(target=_beep, daemon=True).start()
-                            self._last_beep = time.perf_counter()
+                        if winsound:
+                            try:
+                                winsound.Beep(2000, 80)
+                            except Exception:
+                                pass
                     else:
                         s.val_lbl.configure(foreground=s.color)
                     row_vals.append(val)
@@ -461,12 +505,13 @@ class App(tk.Tk):
         if any_read and self.csv_writer:
             try:
                 self.csv_writer.writerow([f"{stamp:.6f}", *row_vals])
-                self.csv_file.flush()
+                self._csv_flush_count += 1
+                if self._csv_flush_count >= self._csv_flush_every:
+                    self.csv_file.flush()
+                    self._csv_flush_count = 0
             except Exception:
                 pass
-        # draw
-        self._refresh_plots()
-        # schedule next tick at 10 Hz
+        # schedule next tick at 10 Hz (plots are refreshed by a separate timer)
         self._tick_after_id = self.after(int(self.dt * 1000), self._tick)
 
     # Backwards-compatible sampling loop used by older Start/Stop flow
@@ -528,8 +573,9 @@ class App(tk.Tk):
     # Live plotting helpers -------------------------------------------------
     def _refresh_plots(self):
         self._draw_time_plot()
-        # update FFT less frequently
-        if not hasattr(self, '_last_fft_draw') or (time.time() - self._last_fft_draw) > self.fft_interval_s:
+        # update FFT less frequently and allow disabling to save CPU
+        if (getattr(self, 'fft_enabled', tk.BooleanVar(value=True)).get() and
+            (not hasattr(self, '_last_fft_draw') or (time.time() - self._last_fft_draw) > self.fft_interval_s)):
             self._draw_fft_plot()
             self._last_fft_draw = time.time()
         # Schedule next regular refresh in case sampler is not running
@@ -553,8 +599,14 @@ class App(tk.Tk):
                 line.set_data([], [])
                 continue
             now_t = s.data[-1][0]
-            xs = [t - (now_t - window_s) for t, _ in s.data if now_t - t <= window_s]
-            ys = [v for t, v in s.data if now_t - t <= window_s]
+            vals = [(t, v) for t, v in s.data if now_t - t <= window_s]
+            # Downsample to cap number of points rendered
+            max_points = 300
+            if len(vals) > max_points:
+                step = max(1, len(vals) // max_points)
+                vals = vals[::step]
+            xs = [t - (now_t - window_s) for t, _ in vals]
+            ys = [v for _, v in vals]
             line.set_data(xs, ys)
             if ys:
                 ymin, ymax = min(ys), max(ys)
@@ -565,16 +617,14 @@ class App(tk.Tk):
             ax.set_xlim(0, window_s)
             # Update Y label with unit for clarity
             if s.connected and s.selected_measurement:
-                try:
-                    unit = s.dev.get_measurement_unit(s.selected_measurement)
-                except Exception:
-                    unit = ''
+                unit = getattr(s, 'unit', '')
                 ylabel = f'Acceleration [{unit}]' if unit else 'Acceleration'
                 ax.set_ylabel(ylabel)
-        # Use deferred drawing for responsiveness
         self.canvas_time.draw_idle()
 
     def _draw_fft_plot(self):
+        if hasattr(self, 'performance_mode') and self.performance_mode.get():
+            return
         max_freq = self.fs / 2.0
         best_peaks = []
         visible = {s.name: self.visible.get(s.name, tk.BooleanVar(value=True)).get() for s in self.sensors}
@@ -608,7 +658,7 @@ class App(tk.Tk):
             info = 'Dominant peaks: ' + ', '.join(f"{name}:{f:.2f}Hz" for name,(f,_ ) in best_peaks)
         else:
             info = 'Dominant peaks: —'
-        self.fft_info.config(text=info)
+        self.fft_info.config(text=('Dominant peaks: -' if not best_peaks else info))
 
     # Recording control -----------------------------------------------------
     def start_recording(self):
