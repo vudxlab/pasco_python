@@ -91,8 +91,7 @@ class SensorClient:
             w = csv.writer(f)
             w.writerow(['time_s', self.selected_measurement or 'value'])
             for t, v in self.data:
-                vfmt = f"{float(v):.4f}" if isinstance(v, (int, float)) else ''
-                w.writerow([f"{t:.6f}", vfmt])
+                w.writerow([f"{t:.6f}", v])
 
 
 def compute_fft(times_vals, fixed_fs=10.0):
@@ -153,12 +152,8 @@ class App(tk.Tk):
         self.geometry('1200x720')
 
         # Fixed 10 Hz sampling
-        self.fs = 10.0               # base sampling/logging rate (fixed)
+        self.fs = 10.0
         self.dt = 1.0 / self.fs
-        # Display sampling (upsampling via interpolation if >10 Hz)
-        self.display_fs_choices = [10, 20, 40, 80, 160, 320, 640]
-        self.display_fs = 10.0
-        self.display_dt = 1.0 / self.display_fs
         # Compatibility flags for older start/stop flow
         self.loop_running = False
 
@@ -540,11 +535,7 @@ class App(tk.Tk):
         # Auto-append to CSV if any sensor produced a sample
         if any_read and self.csv_writer:
             try:
-                row_vals_fmt = [
-                    (f"{v:.4f}" if isinstance(v, (int, float)) else '')
-                    for v in row_vals
-                ]
-                self.csv_writer.writerow([f"{stamp:.6f}", *row_vals_fmt])
+                self.csv_writer.writerow([f"{stamp:.6f}", *row_vals])
                 self._csv_flush_count += 1
                 if self._csv_flush_count >= self._csv_flush_every:
                     self.csv_file.flush()
@@ -602,8 +593,7 @@ class App(tk.Tk):
                     vals = []
                     for s in self.sensors:
                         if i < len(s.data):
-                            val = s.data[i][1]
-                            vals.append(f"{float(val):.4f}" if isinstance(val, (int, float)) else '')
+                            vals.append(s.data[i][1])
                         else:
                             vals.append('')
                     w.writerow([f"{t:.6f}", *vals])
@@ -636,42 +626,26 @@ class App(tk.Tk):
             ax = self.ax_time
             global_min = None
             global_max = None
-        for s in self.sensors:
-            line = self.time_lines.get(s.name)
-            if not line:
-                continue
-            if not (visible.get(s.name) and s.data):
-                line.set_data([], [])
-                continue
-            now_t = s.data[-1][0]
-            vals = [(t, v) for t, v in s.data if now_t - t <= window_s]
-            max_points = 300
-            if len(vals) > max_points:
-                step = max(1, len(vals) // max_points)
-                vals = vals[::step]
-            xs = [t - (now_t - window_s) for t, _ in vals]
-            ys = [v for _, v in vals]
-            # Upsample last segment for smoother look when display_fs > base fs
-            try:
-                factor = max(1, int(self.display_fs / self.fs))
-            except Exception:
-                factor = 1
-            if factor > 1 and len(vals) >= 2:
-                t0, v0 = vals[-2]
-                t1, v1 = vals[-1]
-                dt = (t1 - t0) / factor if t1 > t0 else 0.0
-                for k in range(1, factor):
-                    ti = t0 + k * dt
-                    if ti >= t1:
-                        break
-                    vi = v0 + (v1 - v0) * (k / factor)
-                    xs.append(ti - (now_t - window_s))
-                    ys.append(vi)
-            line.set_data(xs, ys)
-            if ys:
-                ymin, ymax = min(ys), max(ys)
-                global_min = ymin if global_min is None else min(global_min, ymin)
-                global_max = ymax if global_max is None else max(global_max, ymax)
+            for s in self.sensors:
+                line = self.time_lines.get(s.name)
+                if not line:
+                    continue
+                if not (visible.get(s.name) and s.data):
+                    line.set_data([], [])
+                    continue
+                now_t = s.data[-1][0]
+                vals = [(t, v) for t, v in s.data if now_t - t <= window_s]
+                max_points = 300
+                if len(vals) > max_points:
+                    step = max(1, len(vals) // max_points)
+                    vals = vals[::step]
+                xs = [t - (now_t - window_s) for t, _ in vals]
+                ys = [v for _, v in vals]
+                line.set_data(xs, ys)
+                if ys:
+                    ymin, ymax = min(ys), max(ys)
+                    global_min = ymin if global_min is None else min(global_min, ymin)
+                    global_max = ymax if global_max is None else max(global_max, ymax)
             if ax is not None:
                 if global_min is None or global_max is None:
                     ax.set_ylim(-1, 1)
@@ -702,21 +676,6 @@ class App(tk.Tk):
                     vals = vals[::step]
                 xs = [t - (now_t - window_s) for t, _ in vals]
                 ys = [v for _, v in vals]
-                try:
-                    factor = max(1, int(self.display_fs / self.fs))
-                except Exception:
-                    factor = 1
-                if factor > 1 and len(vals) >= 2:
-                    t0, v0 = vals[-2]
-                    t1, v1 = vals[-1]
-                    dt = (t1 - t0) / factor if t1 > t0 else 0.0
-                    for k in range(1, factor):
-                        ti = t0 + k * dt
-                        if ti >= t1:
-                            break
-                        vi = v0 + (v1 - v0) * (k / factor)
-                        xs.append(ti - (now_t - window_s))
-                        ys.append(vi)
                 line.set_data(xs, ys)
                 if ys:
                     ymin, ymax = min(ys), max(ys)
@@ -818,27 +777,6 @@ class App(tk.Tk):
         ttk.Label(top, text='PASCO Multi-Sensor', font=('Segoe UI', 13, 'bold')).pack(side='left')
         top_controls = ttk.Frame(top)
         top_controls.pack(side='right')
-        # Display sampling selector
-        self.display_fs_var = tk.IntVar(value=int(self.display_fs))
-        try:
-            fs_box = ttk.Combobox(top_controls, state='readonly', width=6,
-                                   values=[str(v) for v in self.display_fs_choices],
-                                   textvariable=self.display_fs_var)
-            fs_box.pack(side='right', padx=4)
-            ttk.Label(top_controls, text='Display Fs (Hz):').pack(side='right', padx=(8, 2))
-
-            def _on_fs_change(*_):
-                try:
-                    val = int(self.display_fs_var.get())
-                except Exception:
-                    val = 10
-                if val not in self.display_fs_choices:
-                    val = 10
-                self.display_fs = float(val)
-                self.display_dt = 1.0 / self.display_fs
-            self.display_fs_var.trace_add('write', _on_fs_change)
-        except Exception:
-            pass
         self.performance_mode = tk.BooleanVar(value=False)
         self.fft_enabled = tk.BooleanVar(value=True)
         ttk.Checkbutton(top_controls, text='Enable FFT', variable=self.fft_enabled).pack(side='right', padx=4)
